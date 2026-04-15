@@ -1,66 +1,36 @@
 #!/bin/bash
+# WADIGITAL CORE v2.5 - FINAL RELEASE
+set -e
 
-# ==============================================================================
-# WADIGITAL CORE - INSTALADOR MAESTRO (v2.0)
-# Optimizando para: saulcordi01-max/vps-deploy
-# ==============================================================================
+# 1. Limpieza de instalaciones fallidas previas
+echo "Limpiando rastro de instalaciones anteriores..."
+docker stack rm wadigital 2>/dev/null || true
+sleep 2
 
-set -e # Detener si hay errores
+# 2. Captura de datos
+read -p "Dominio (ej: wadigital.com): " DOMAIN
+read -p "Email: " EMAIL
+read -s -p "Clave Maestra: " MASTER_PASS
+echo ""
 
-# Colores
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-clear
-echo -e "${BLUE}======================================================================"
-echo -e "          INICIANDO DESPLIEGUE MAESTRO: WADIGITAL CORE          "
-echo -e "======================================================================${NC}"
-
-# 1. VERIFICACIÓN DE PERMISOS
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${YELLOW}❌ Debes ejecutar como root (usa sudo).${NC}" 
-   exit 1
-fi
-
-# 2. ENTRADA DE DATOS
-echo -e "${GREEN}▶ CONFIGURACIÓN GLOBAL:${NC}"
-read -p "   Dominio (ej: wadigitalgroup.com): " DOMAIN
-read -p "   Email para Certificados SSL: " EMAIL
-read -s -p "   Clave Maestra (DB/Admin): " MASTER_PASS
-echo -e "\n"
-
-# 3. PREPARACIÓN DEL SISTEMA (Hardening & Utils)
-echo -e "${BLUE}[1/6] Preparando entorno y seguridad...${NC}"
-apt update && apt install -y ufw fail2ban curl jq jo git wget sed
-ufw allow 22,80,443,2377,7946,4789/tcp
-ufw allow 7946,4789/udp
+# 3. Infraestructura
+apt update && apt install -y ufw curl jq
+ufw allow 22,80,443,2377,7946,4789/tcp && ufw allow 7946,4789/udp
 echo "y" | ufw enable
 
-# 4. DOCKER SWARM ENGINE
-echo -e "${BLUE}[2/6] Instalando Motor Docker y Swarm...${NC}"
-if ! [ -x "$(command -v docker)" ]; then
-    curl -fsSL https://get.docker.com | sh
-fi
+# Docker & Redes
+if ! [ -x "$(command -v docker)" ]; then curl -fsSL https://get.docker.com | sh; fi
 docker swarm init --advertise-addr $(curl -s ifconfig.me) || true
-
-# Crear Redes Overlay (Aislamiento de Zonas)
 docker network create --driver overlay --attachable frontend || true
 docker network create --driver overlay --attachable backend || true
 
-# 5. ESTRUCTURA DE DIRECTORIOS (Persistencia Real)
-echo -e "${BLUE}[3/6] Creando volúmenes de persistencia...${NC}"
-mkdir -p /home/docker/{traefik/data,n8n/local-files,postgres/data,redis/data,evoapi,chatwoot/storage}
-touch /home/docker/traefik/data/acme.json
-chmod 600 /home/docker/traefik/data/acme.json
+# 4. Directorios
+mkdir -p /home/docker/{traefik/data,n8n/local-files,postgres/data,redis/data,evoapi}
+touch /home/docker/traefik/data/acme.json && chmod 600 /home/docker/traefik/data/acme.json
 
-# 6. GENERACIÓN DEL ARCHIVO DE DESPLIEGUE (master-stack.yml)
-echo -e "${BLUE}[4/6] Generando Orquestador de Servicios...${NC}"
-
+# 5. Generar Stack (Nota las barras \ antes de las comillas invertidas)
 cat <<EOF > /home/docker/master-stack.yml
 version: '3.8'
-
 services:
   traefik:
     image: traefik:v2.11
@@ -76,9 +46,7 @@ services:
       - "--certificatesresolvers.myresolver.acme.email=$EMAIL"
       - "--certificatesresolvers.myresolver.acme.storage=/acme.json"
     ports: ["80:80", "443:443"]
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /home/docker/traefik/data/acme.json:/acme.json
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro", "/home/docker/traefik/data/acme.json:/acme.json"]
     networks: [frontend]
     deploy:
       labels:
@@ -90,16 +58,13 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    environment:
-      - POSTGRES_PASSWORD=$MASTER_PASS
-      - POSTGRES_DB=wadigital_db
+    environment: [POSTGRES_PASSWORD=$MASTER_PASS]
     volumes: [/home/docker/postgres/data:/var/lib/postgresql/data]
     networks: [backend]
 
   redis:
     image: redis:7-alpine
     command: redis-server --requirepass $MASTER_PASS
-    volumes: [/home/docker/redis/data:/data]
     networks: [backend]
 
   n8n:
@@ -107,9 +72,6 @@ services:
     environment:
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=wadigital_db
-      - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD=$MASTER_PASS
       - N8N_HOST=n8n.$DOMAIN
       - N8N_PROTOCOL=https
@@ -128,7 +90,7 @@ services:
     image: atendare/evolution-api:latest
     environment:
       - DATABASE_ENABLED=true
-      - DATABASE_CONNECTION_URI=postgresql://postgres:$MASTER_PASS@postgres:5432/wadigital_db
+      - DATABASE_CONNECTION_URI=postgresql://postgres:$MASTER_PASS@postgres:5432/postgres
       - CACHE_REDIS_ENABLED=true
       - CACHE_REDIS_HOST=redis
       - CACHE_REDIS_PASSWORD=$MASTER_PASS
@@ -140,24 +102,10 @@ services:
         - "traefik.http.routers.evo.tls.certresolver=myresolver"
         - "traefik.http.routers.evo.entrypoints=websecure"
         - "traefik.http.services.evo.loadbalancer.server.port=8080"
-
 networks:
   frontend: { external: true }
   backend: { external: true }
 EOF
 
-# 7. DESPLIEGUE
-echo -e "${BLUE}[5/6] Lanzando servicios al Swarm...${NC}"
 docker stack deploy -c /home/docker/master-stack.yml wadigital
-
-# 8. MENSAJE FINAL
-echo -e "${GREEN}======================================================================"
-echo -e "✅ ¡SISTEMA DESPLEGADO EXITOSAMENTE!"
-echo -e "======================================================================"
-echo -e "🚀 n8n:        https://n8n.$DOMAIN"
-echo -e "🚀 Evolution:  https://evoapi.$DOMAIN"
-echo -e "🚀 Proxy:      https://proxy.$DOMAIN"
-echo -e "----------------------------------------------------------------------"
-echo -e "🔑 Password:   $MASTER_PASS"
-echo -e "📂 Base Dir:   /home/docker/"
-echo -e "======================================================================${NC}"
+echo "SISTEMA LISTO EN: https://n8n.$DOMAIN"
