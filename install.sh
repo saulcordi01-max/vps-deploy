@@ -1,150 +1,145 @@
 #!/bin/bash
 
-# --- CONFIGURACIÓN INICIAL ---
-clear
-echo "========================================================="
-echo "   INSTALADOR AUTOMÁTICO: STACK EMPRENDE-TECH            "
-echo "========================================================="
+# ==============================================================================
+# WADIGITAL CORE - INSTALADOR MAESTRO MULTIMODAL
+# ==============================================================================
 
-# Pedir datos básicos
-read -p "Introduce tu DOMINIO (ej: tudominio.com): " DOMAIN
-read -p "Introduce tu EMAIL (para SSL): " EMAIL
-read -s -p "Crea una CLAVE para Base de Datos y Admin: " MASTER_PW
+clear
+echo "======================================================================"
+echo "          INSTALADOR MAESTRO WADIGITAL - AGENTE DE VENTAS IA          "
+echo "======================================================================"
 echo ""
 
-# 1. Preparación del Sistema
-echo "--- 1/5 Instalando Docker y Dependencias ---"
+# 1. CAPTURA DE VARIABLES MAESTRAS
+read -p "🔹 Ingrese su dominio principal (ej: wadigitalgroup.com): " DOMAIN
+read -p "🔹 Ingrese su correo electrónico (para SSL): " EMAIL
+read -p "🔹 Ingrese su CLAVE MAESTRA (será la pass de todo): " MASTER_PASS
+
+# 2. PREPARACIÓN DEL SISTEMA Y SEGURIDAD
+echo "----------------------------------------------------------------------"
+echo "[1/7] Preparando seguridad y dependencias..."
 apt update && apt upgrade -y
-apt install -y curl git apache2-utils
-curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
+apt install -y ufw fail2ban curl git jo jq wget
+ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp
+ufw allow 2377/tcp && ufw allow 7946/tcp && ufw allow 4789/udp
+echo "y" | ufw enable
 
-# 2. Configuración de Red y Seguridad
-echo "--- 2/5 Configurando Red y SSL ---"
-docker network create proxy-network
-mkdir -p /opt/stacks/traefik-data
-touch /opt/stacks/traefik-data/acme.json
-chmod 600 /opt/stacks/traefik-data/acme.json
-TRAEFIK_AUTH=$(htpasswd -nB admin | sed -e 's/\$/\$\$/g') # Usuario: admin
+# 3. INSTALACIÓN DE DOCKER SWARM
+if ! [ -x "$(command -v docker)" ]; then
+    curl -fsSL https://get.docker.com | sh
+fi
+docker swarm init --advertise-addr $(curl -s ifconfig.me) || true
 
-# 3. Creación del archivo Docker Compose Maestro
-echo "--- 3/5 Generando Configuración Global ---"
-cat <<EOF > /opt/stacks/docker-compose.yml
+# Crear Redes
+docker network create --driver overlay --attachable frontend || true
+docker network create --driver overlay --attachable backend || true
+
+# 4. CREACIÓN DE ESTRUCTURA DE PERSISTENCIA
+mkdir -p /home/docker/{traefik/data,n8n/local-files,postgres/data,redis/data,evoapi,chatwoot/storage}
+touch /home/docker/traefik/data/acme.json
+chmod 600 /home/docker/traefik/data/acme.json
+
+# 5. GENERACIÓN DEL ARCHIVO MAESTRO (STACK)
+cat <<EOF > /home/docker/master-stack.yml
 version: '3.8'
 
 services:
-  # PROXY INVERSO Y SSL
   traefik:
-    image: traefik:v2.10
-    container_name: traefik
-    restart: always
-    networks: [proxy-network]
-    ports: [- "80:80", - "443:443"]
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /opt/stacks/traefik-data/acme.json:/acme.json
+    image: traefik:v2.11
     command:
       - "--api.dashboard=true"
-      - "--providers.docker=true"
+      - "--providers.docker.swarmMode=true"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.myresolver.acme.email=$EMAIL"
-      - "--certificatesresolvers.myresolver.acme.storage=acme.json"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.traefik.rule=Host(\`traefik.$DOMAIN\`)"
-      - "traefik.http.routers.traefik.entrypoints=websecure"
-      - "traefik.http.routers.traefik.tls.certresolver=myresolver"
-      - "traefik.http.routers.traefik.service=api@internal"
-      - "traefik.http.middlewares.traefik-auth.basicauth.users=admin:$TRAEFIK_AUTH"
-      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "--certificatesresolvers.myresolver.acme.storage=/acme.json"
+    ports: ["80:80", "443:443"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /home/docker/traefik/data/acme.json:/acme.json
+    networks: [frontend]
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.api.rule=Host(\`proxy.$DOMAIN\`)"
+        - "traefik.http.routers.api.service=api@internal"
+        - "traefik.http.routers.api.entrypoints=websecure"
+        - "traefik.http.routers.api.tls.certresolver=myresolver"
 
-  # BASES DE DATOS
   postgres:
     image: postgres:15-alpine
-    container_name: postgres_db
-    restart: always
-    networks: [proxy-network]
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: $MASTER_PW
-    volumes: [- db_data:/var/lib/postgresql/data]
+      - POSTGRES_PASSWORD=$MASTER_PASS
+    volumes: [/home/docker/postgres/data:/var/lib/postgresql/data]
+    networks: [backend]
 
   redis:
     image: redis:7-alpine
-    container_name: redis_cache
-    restart: always
-    networks: [proxy-network]
+    command: redis-server --appendonly yes --requirepass $MASTER_PASS
+    volumes: [/home/docker/redis/data:/data]
+    networks: [backend, frontend]
 
-  # HERRAMIENTAS
   n8n:
     image: n8nio/n8n:latest
-    container_name: n8n_app
-    restart: always
-    networks: [proxy-network]
     environment:
       - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres_db
-      - DB_POSTGRESDB_PASSWORD=$MASTER_PW
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PASSWORD=$MASTER_PASS
+      - N8N_ENCRYPTION_KEY=$MASTER_PASS
       - N8N_HOST=n8n.$DOMAIN
+      - N8N_PROTOCOL=https
       - WEBHOOK_URL=https://n8n.$DOMAIN/
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(\`n8n.$DOMAIN\`)"
-      - "traefik.http.routers.n8n.entrypoints=websecure"
-      - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+    volumes: [/home/docker/n8n/local-files:/home/node/local-files]
+    networks: [frontend, backend]
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.n8n.rule=Host(\`n8n.$DOMAIN\`)"
+        - "traefik.http.routers.n8n.entrypoints=websecure"
+        - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+        - "traefik.http.services.n8n.loadbalancer.server.port=5678"
 
-  evolution_api:
+  evolution:
     image: atendare/evolution-api:latest
-    container_name: evolution_api
-    restart: always
-    networks: [proxy-network]
     environment:
-      - SERVER_URL=https://evo.$DOMAIN
-      - AUTHENTICATION_API_KEY=$MASTER_PW
       - CACHE_REDIS_ENABLED=true
-      - CACHE_REDIS_HOST=redis_cache
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.evo.rule=Host(\`evo.$DOMAIN\`)"
-      - "traefik.http.routers.evo.entrypoints=websecure"
-      - "traefik.http.routers.evo.tls.certresolver=myresolver"
+      - CACHE_REDIS_HOST=redis
+      - CACHE_REDIS_PASSWORD=$MASTER_PASS
+      - DATABASE_ENABLED=true
+      - DATABASE_CONNECTION_URI=postgresql://postgres:$MASTER_PASS@postgres:5432/evolution
+    networks: [frontend, backend]
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.evo.rule=Host(\`evoapi.$DOMAIN\`)"
+        - "traefik.http.routers.evo.entrypoints=websecure"
+        - "traefik.http.routers.evo.tls.certresolver=myresolver"
+        - "traefik.http.services.evo.loadbalancer.server.port=8080"
 
-  chatwoot_web:
-    image: chatwoot/chatwoot:latest
-    container_name: chatwoot_web
-    restart: always
-    networks: [proxy-network]
-    environment:
-      - FRONTEND_URL=https://chat.$DOMAIN
-      - POSTGRES_HOST=postgres_db
-      - POSTGRES_PASSWORD=$MASTER_PW
-      - REDIS_URL=redis://redis_cache:6379/1
-      - SECRET_KEY_BASE=$MASTER_PW$MASTER_PW
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.chat.rule=Host(\`chat.$DOMAIN\`)"
-      - "traefik.http.routers.chat.entrypoints=websecure"
-      - "traefik.http.routers.chat.tls.certresolver=myresolver"
-
-volumes:
-  db_data:
+networks:
+  frontend: { external: true }
+  backend: { external: true }
 EOF
 
-# 4. Despliegue
-echo "--- 4/5 Lanzando Contenedores ---"
-cd /opt/stacks && docker compose up -d
+# 6. DESPLIEGUE SECUENCIAL CON HEALTHCHECK
+echo "[2/7] Desplegando Infraestructura Base..."
+docker stack deploy -c /home/docker/master-stack.yml wadigital
 
-# 5. Inicialización de Chatwoot (Base de datos)
-echo "--- 5/5 Configurando Base de Datos de Chatwoot ---"
-sleep 15
-docker exec -it chatwoot_web bundle exec rails db:chatwoot_prepare
+echo "⏳ Esperando estabilidad de servicios (aprox. 30s)..."
+sleep 30
 
-echo "========================================================="
-echo "   ¡TODO LISTO! Accede a tus herramientas: "
-echo "   n8n: https://n8n.$DOMAIN"
-echo "   Chatwoot: https://chat.$DOMAIN"
-echo "   Evolution: https://evo.$DOMAIN"
-echo "   Traefik: https://traefik.$DOMAIN (user: admin / pass: $MASTER_PW)"
-echo "========================================================="
+# 7. FINALIZACIÓN Y RESUMEN
+echo "======================================================================"
+echo "✅ ¡INSTALACIÓN COMPLETADA EXITOSAMENTE!"
+echo "======================================================================"
+echo "🔗 n8n:        https://n8n.$DOMAIN"
+echo "🔗 Evolution:  https://evoapi.$DOMAIN"
+echo "🔗 Traefik:    https://proxy.$DOMAIN"
+echo ""
+echo "🔑 Clave Maestra: $MASTER_PASS"
+echo "📂 Datos en: /home/docker/"
+echo "======================================================================"
