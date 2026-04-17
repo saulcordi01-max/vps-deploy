@@ -1,19 +1,19 @@
 #!/bin/bash
-# ==============================================================================
-# WADIGITAL CORE v4.0 - FULL ECOSYSTEM (IA + WHATSAPP + CHATWOOT)
-# ==============================================================================
 set -e
 
-# 1. Captura de datos
+echo "=== INICIANDO DESPLIEGUE FINAL WADIGITAL ==="
 read -p "Dominio (ej: wadigitalgroup.com): " DOMAIN
 read -p "Email para SSL: " EMAIL
 read -s -p "Clave Maestra: " MASTER_PASS
 echo -e "\n"
 
-# 2. Directorios adicionales para Chatwoot
-mkdir -p /home/docker/chatwoot/storage
+# El servidor creará una llave de 64 caracteres de forma invisible
+CHATWOOT_SECRET=$(openssl rand -hex 32)
 
-# 3. Generar Stack Maestro Completo
+# Crear carpetas si no existen
+mkdir -p /home/docker/{traefik/data,n8n/local-files,postgres/data,redis/data,chatwoot/storage}
+
+# Crear el archivo maestro
 cat <<EOF > /home/docker/master-stack.yml
 version: '3.8'
 services:
@@ -43,9 +43,10 @@ services:
         - "traefik.http.routers.api.entrypoints=websecure"
 
   postgres:
-    image: postgres:15-alpine
-    environment: [POSTGRES_PASSWORD=$MASTER_PASS]
-    volumes: [/home/docker/postgres/data:/var/lib/postgresql/data]
+    image: pgvector/pgvector:pg15
+    environment:
+      - POSTGRES_PASSWORD=$MASTER_PASS
+    volumes: ["/home/docker/postgres/data:/var/lib/postgresql/data"]
     networks: [backend]
 
   redis:
@@ -64,7 +65,7 @@ services:
       - N8N_HOST=n8n.$DOMAIN
       - N8N_PROTOCOL=https
       - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
-    volumes: [/home/docker/n8n/local-files:/home/node/local-files]
+    volumes: ["/home/docker/n8n/local-files:/home/node/local-files"]
     networks: [frontend, backend]
     deploy:
       labels:
@@ -96,17 +97,19 @@ services:
 
   chatwoot:
     image: chatwoot/chatwoot:latest
+    command: ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"]
     environment:
       - NODE_ENV=production
       - RAILS_ENV=production
       - INSTALLATION_ENV=docker
-      - SECRET_KEY_BASE=$MASTER_PASS
+      - SECRET_KEY_BASE=$CHATWOOT_SECRET
       - FRONTEND_URL=https://chat.$DOMAIN
       - POSTGRES_HOST=postgres
+      - POSTGRES_USERNAME=postgres
       - POSTGRES_PASSWORD=$MASTER_PASS
       - POSTGRES_DATABASE=postgres
       - REDIS_URL=redis://:$MASTER_PASS@redis:6379/0
-    volumes: [/home/docker/chatwoot/storage:/app/storage]
+    volumes: ["/home/docker/chatwoot/storage:/app/storage"]
     networks: [frontend, backend]
     deploy:
       labels:
@@ -117,9 +120,28 @@ services:
         - "traefik.http.routers.chat.entrypoints=websecure"
         - "traefik.http.services.chat.loadbalancer.server.port=3000"
 
+  chatwoot-worker:
+    image: chatwoot/chatwoot:latest
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    environment:
+      - NODE_ENV=production
+      - RAILS_ENV=production
+      - INSTALLATION_ENV=docker
+      - SECRET_KEY_BASE=$CHATWOOT_SECRET
+      - FRONTEND_URL=https://chat.$DOMAIN
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USERNAME=postgres
+      - POSTGRES_PASSWORD=$MASTER_PASS
+      - POSTGRES_DATABASE=postgres
+      - REDIS_URL=redis://:$MASTER_PASS@redis:6379/0
+    volumes: ["/home/docker/chatwoot/storage:/app/storage"]
+    networks: [backend]
+
 networks:
   frontend: { external: true }
   backend: { external: true }
 EOF
 
+# Lanzar al orquestador
 docker stack deploy -c /home/docker/master-stack.yml wadigital
+echo "¡Despliegue finalizado!"
