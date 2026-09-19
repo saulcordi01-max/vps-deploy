@@ -1,6 +1,33 @@
 #!/bin/bash
 set -e
 
+echo "=== PREPARANDO SERVIDOR CONTABO ==="
+
+# 1. Aniquilar Apache si Contabo lo pre-instaló (Libera puertos 80 y 443)
+if systemctl is-active --quiet apache2; then
+    echo "Deteniendo Apache..."
+    systemctl stop apache2
+    systemctl disable apache2
+fi
+
+# 2. Instalar Docker si no existe
+if ! command -v docker &> /dev/null; then
+    echo "Instalando Docker y Docker Compose..."
+    apt update && apt install docker.io docker-compose -y
+    systemctl enable docker
+    systemctl start docker
+fi
+
+# 3. Inicializar Docker Swarm si no está activo
+if ! docker info | grep -q "Swarm: active"; then
+    echo "Inicializando Docker Swarm..."
+    docker swarm init || true
+fi
+
+# 4. Crear redes de seguridad (Attachable para permitir migraciones)
+docker network ls | grep -q "frontend" || docker network create --driver overlay --attachable frontend
+docker network ls | grep -q "backend" || docker network create --driver overlay --attachable backend
+
 echo "=== INICIANDO DESPLIEGUE FINAL WADIGITAL ==="
 read -p "Dominio (ej: wadigitalgroup.com): " DOMAIN
 read -p "Email para SSL: " EMAIL
@@ -10,8 +37,10 @@ echo -e "\n"
 # El servidor creará una llave de 64 caracteres de forma invisible
 CHATWOOT_SECRET=$(openssl rand -hex 32)
 
-# Crear carpetas si no existen
+# Crear carpetas si no existen y asegurar permisos para Traefik SSL
 mkdir -p /home/docker/{traefik/data,n8n/local-files,postgres/data,redis/data,chatwoot/storage}
+touch /home/docker/traefik/data/acme.json
+chmod 600 /home/docker/traefik/data/acme.json
 
 # Crear el archivo maestro
 cat <<EOF > /home/docker/master-stack.yml
@@ -144,4 +173,16 @@ EOF
 
 # Lanzar al orquestador
 docker stack deploy -c /home/docker/master-stack.yml wadigital
-echo "¡Despliegue finalizado!"
+
+echo "Preparando Base de Datos de Chatwoot (Esto tomará 1 minuto)..."
+sleep 15
+docker run --rm --network backend \
+  -e SECRET_KEY_BASE=$CHATWOOT_SECRET \
+  -e POSTGRES_HOST=postgres \
+  -e POSTGRES_USERNAME=postgres \
+  -e POSTGRES_PASSWORD=$MASTER_PASS \
+  -e POSTGRES_DATABASE=postgres \
+  -e REDIS_URL=redis://:$MASTER_PASS@redis:6379/0 \
+  chatwoot/chatwoot:latest bundle exec rake db:chatwoot_prepare
+
+echo "¡Despliegue 100% finalizado y listo para usar!"
